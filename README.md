@@ -17,23 +17,23 @@ Use this script to run control from PC:
 ### Run command
 
 ```bash
-python esp32_pid_runner.py --esp-ip 192.168.137.42 --setpoint 37 --dt 0.7
+python esp32_pid_runner.py --esp-ip 10.152.250.98 --setpoint 37 --dt 0.7
 ```
 
 ### Useful options
 
 ```bash
 # run for 20 minutes
-python esp32_pid_runner.py --esp-ip 192.168.137.42 --duration 1200
+python esp32_pid_runner.py --esp-ip 10.152.250.98 --duration 1200
 
 # fixed number of control steps
-python esp32_pid_runner.py --esp-ip 192.168.137.42 --steps 1000
+10.152.250.98
 
 # custom starting PID gains
-python esp32_pid_runner.py --esp-ip 192.168.137.42 --kp 20 --ki 0.5 --kd 5
+python esp32_pid_runner.py --esp-ip 10.152.250.98 --kp 20 --ki 0.5 --kd 5
 
 # enable online NN autotuning
-python esp32_pid_runner.py --esp-ip 192.168.137.42 --autotune
+python esp32_pid_runner.py --esp-ip 10.152.250.98 --autotune
 ```
 
 ### Safety and logging

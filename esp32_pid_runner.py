@@ -10,6 +10,9 @@ from datetime import datetime
 from pid import PID
 
 
+MAX_PWM_CAP = 125
+
+
 def http_get_text(url, timeout_s):
     with urllib.request.urlopen(url, timeout=timeout_s) as response:
         return response.read().decode("utf-8").strip()
@@ -41,7 +44,7 @@ def read_temp(esp_ip, timeout_s):
 
 
 def write_pwm(esp_ip, pwm, timeout_s):
-    pwm = int(max(0, min(255, pwm)))
+    pwm = int(max(0, min(MAX_PWM_CAP, pwm)))
     reply = http_post_text(f"http://{esp_ip}/pwm", str(pwm), timeout_s)
     return reply
 
@@ -56,12 +59,12 @@ def parse_args():
         description="Run PID control loop on PC using ESP32 sensor/actuator endpoints."
     )
     parser.add_argument("--esp-ip", required=True, help="ESP32 IP address (example: 192.168.137.42)")
-    parser.add_argument("--setpoint", type=float, default=37.0, help="Target chamber temperature in C")
-    parser.add_argument("--dt", type=float, default=0.7, help="Control period in seconds")
+    parser.add_argument("--setpoint", type=float, default=35.0, help="Target chamber temperature in C")
+    parser.add_argument("--dt", type=float, default=1.0, help="Control period in seconds (CHANGED: was 0.7, now 1.0 for thermal systems)")
 
-    parser.add_argument("--kp", type=float, default=69.69, help="Initial Kp")
-    parser.add_argument("--ki", type=float, default=68.69, help="Initial Ki")
-    parser.add_argument("--kd", type=float, default=69.0, help="Initial Kd")
+    parser.add_argument("--kp", type=float, default=25.0, help="Initial Kp (CHANGED: was 69.69, now 25.0 - less aggressive)")
+    parser.add_argument("--ki", type=float, default=8.0, help="Initial Ki (CHANGED: was 68.69, now 8.0 - less aggressive)")
+    parser.add_argument("--kd", type=float, default=3.0, help="Initial Kd (CHANGED: was 69.0, now 3.0 - less aggressive)")
 
     parser.add_argument("--steps", type=int, default=0, help="Number of control steps, 0 means run forever")
     parser.add_argument("--duration", type=float, default=0.0, help="Run duration in seconds, 0 means no limit")
@@ -74,10 +77,10 @@ def parse_args():
     parser.add_argument("--status-every", type=int, default=20, help="Print /status every N steps, 0 disables")
 
     parser.add_argument("--autotune", action="store_true", help="Enable online NN-based autotuning")
-    parser.add_argument("--retune-every", type=int, default=50, help="Retune period in steps")
-    parser.add_argument("--retune-start", type=int, default=100, help="Start retuning after this step")
-    parser.add_argument("--imc-L", type=float, default=0.7, help="IMC dead-time estimate")
-    parser.add_argument("--imc-lambda", type=float, default=3.0, help="IMC lambda")
+    parser.add_argument("--retune-every", type=int, default=150, help="Retune period in steps (CHANGED: was 50, now 150 - less frequent)")
+    parser.add_argument("--retune-start", type=int, default=250, help="Start retuning after this step (CHANGED: was 100, now 250 - wait for NN convergence)")
+    parser.add_argument("--imc-L", type=float, default=1.2, help="IMC dead-time estimate (CHANGED: was 0.7, now 1.2)")
+    parser.add_argument("--imc-lambda", type=float, default=6.0, help="IMC lambda (CHANGED: was 3.0, now 6.0 - more conservative)")
 
     return parser.parse_args()
 
@@ -88,11 +91,15 @@ def main():
     if args.dt <= 0:
         raise ValueError("--dt must be > 0")
 
-    pid = PID(args.kp, args.ki, args.kd, args.dt)
+    # Initialize PID controller with verbose logging
+    pid = PID(args.kp, args.ki, args.kd, args.dt, verbose=True)
+    
+    # Initialize autotuning components
     nn_model = None
     estimate_parameters = None
     compute_tau_K = None
     imc_pid = None
+    
     if args.autotune:
         try:
             from autotuner import compute_tau_K as _compute_tau_K
@@ -107,7 +114,22 @@ def main():
         estimate_parameters = _estimate_parameters
         compute_tau_K = _compute_tau_K
         imc_pid = _imc_pid
-        nn_model = NeuralPlantModel()
+        
+        # Create neural model with verbose diagnostics and proper normalization
+        nn_model = NeuralPlantModel(
+            temp_ref=args.setpoint,  # Use setpoint as reference temperature
+            temp_scale=10.0,          # Expected deviation range ±10°C
+            verbose=True              # Enable detailed logging
+        )
+        
+        print("\n" + "🤖"*35)
+        print("AUTOTUNING ENABLED - Neural Network Will Learn Plant Dynamics")
+        print("🤖"*35)
+        print(f"  Normalization: (T - {args.setpoint}) / 10.0")
+        print(f"  First retune at step: {args.retune_start}")
+        print(f"  Retune frequency: every {args.retune_every} steps")
+        print(f"  IMC parameters: L={args.imc_L}, λ={args.imc_lambda}")
+        print("🤖"*35 + "\n")
 
     temps = []
     powers = []
@@ -119,9 +141,16 @@ def main():
     start_t = time.monotonic()
     next_tick = start_t
 
-    print("Starting ESP32 PID loop")
-    print(f"ESP32: {args.esp_ip} | setpoint={args.setpoint:.2f}C | dt={args.dt:.3f}s")
-    print(f"Logging CSV to: {args.csv}")
+    print("\n" + "="*70)
+    print("STARTING ESP32 PID CONTROL LOOP")
+    print("="*70)
+    print(f"  ESP32 IP:        {args.esp_ip}")
+    print(f"  Setpoint:        {args.setpoint:.2f}°C")
+    print(f"  Control period:  {args.dt:.3f}s")
+    print(f"  Initial PID:     Kp={args.kp:.2f}, Ki={args.ki:.2f}, Kd={args.kd:.2f}")
+    print(f"  CSV log:         {args.csv}")
+    print(f"  Safety cutoff:   {args.host_max_temp:.2f}°C")
+    print("="*70 + "\n")
 
     with open(args.csv, "w", newline="", encoding="utf-8") as csv_file:
         writer = csv.writer(csv_file)
@@ -153,85 +182,175 @@ def main():
                 elapsed_s = loop_t - start_t
 
                 if args.steps > 0 and step >= args.steps:
-                    print("Step limit reached, stopping.")
+                    print("\n" + "="*70)
+                    print("STEP LIMIT REACHED - STOPPING")
+                    print("="*70)
                     break
                 if args.duration > 0 and elapsed_s >= args.duration:
-                    print("Duration limit reached, stopping.")
+                    print("\n" + "="*70)
+                    print("DURATION LIMIT REACHED - STOPPING")
+                    print("="*70)
                     break
 
+                # ============================================================
+                # READ TEMPERATURE FROM ESP32
+                # ============================================================
                 try:
                     temp_c, esp_safety = read_temp(args.esp_ip, args.request_timeout)
                     consecutive_failures = 0
                 except (ValueError, urllib.error.URLError, TimeoutError) as exc:
                     consecutive_failures += 1
-                    print(f"Step {step:05d} | sensor read failed ({consecutive_failures}/{args.max_failures}): {exc}")
+                    print(f"\n❌ Step {step:05d} | SENSOR READ FAILED ({consecutive_failures}/{args.max_failures})")
+                    print(f"   Error: {exc}")
 
                     try:
                         write_pwm(args.esp_ip, 0, args.request_timeout)
+                        print(f"   → Set PWM=0 for safety")
                     except Exception:
                         pass
 
                     if consecutive_failures >= args.max_failures:
-                        print("Too many communication failures. Stopping run.")
+                        print("\n" + "="*70)
+                        print("TOO MANY COMMUNICATION FAILURES - STOPPING")
+                        print("="*70)
                         break
 
                     next_tick += args.dt
                     step += 1
                     continue
 
+                # ============================================================
+                # COMPUTE PID CONTROL OUTPUT
+                # ============================================================
                 error_c = args.setpoint - temp_c
                 heater_norm = pid.Calculate_heater(args.setpoint, temp_c)
                 host_safety = temp_c >= args.host_max_temp
 
+                # Safety override
                 if esp_safety or host_safety:
                     heater_norm = 0.0
+                    if step % 10 == 0:  # Don't spam this message
+                        if esp_safety:
+                            print(f"⚠️  Step {step:05d} | ESP SAFETY TRIGGERED - Heater disabled")
+                        if host_safety:
+                            print(f"⚠️  Step {step:05d} | HOST SAFETY TRIGGERED (T={temp_c:.2f}°C ≥ {args.host_max_temp:.2f}°C) - Heater disabled")
 
                 heater_norm = max(0.0, min(1.0, heater_norm))
-                pwm_cmd = int(round(heater_norm * 255.0))
+                pwm_cmd = int(round(heater_norm * MAX_PWM_CAP))
 
+                # ============================================================
+                # SEND PWM COMMAND TO ESP32
+                # ============================================================
                 try:
                     write_pwm(args.esp_ip, pwm_cmd, args.request_timeout)
                 except (urllib.error.URLError, TimeoutError) as exc:
-                    print(f"Step {step:05d} | pwm write failed: {exc}")
+                    print(f"⚠️  Step {step:05d} | PWM write failed: {exc}")
 
+                # ============================================================
+                # STORE DATA FOR NEURAL NETWORK TRAINING
+                # ============================================================
                 temps.append(temp_c)
                 powers.append(heater_norm)
 
+                # ============================================================
+                # NEURAL NETWORK TRAINING & AUTOTUNING
+                # ============================================================
                 loss_val = None
                 if args.autotune and nn_model is not None:
+                    # Add training sample (need at least 3 historical points)
                     if len(temps) >= 3:
                         nn_model.add_sample(
-                            temps[-3],
-                            temps[-2],
-                            powers[-2],
-                            powers[-3],
-                            temps[-1],
+                            temps[-3],   # T[k-2]
+                            temps[-2],   # T[k-1]
+                            powers[-2],  # U[k-1]
+                            powers[-3],  # U[k-2]
+                            temps[-1],   # T[k] (target to predict)
                         )
-
-                    loss_val = nn_model.train_step()
+                    
+                    # Train neural network with mini-batching
+                    loss_val = nn_model.train_step(batch_size=32, num_epochs=1)
                     losses.append(loss_val if loss_val is not None else float("nan"))
-
-                    if step % args.retune_every == 0 and step > args.retune_start:
+                    
+                    # Print comprehensive diagnostics periodically
+                    if step > 0 and step % 200 == 0:
+                        nn_model.print_diagnostics()
+                    
+                    # ========================================================
+                    # ATTEMPT PID RETUNING
+                    # ========================================================
+                    if step >= args.retune_start and step % args.retune_every == 0:
+                        print("\n" + "🔧"*35)
+                        print(f"[AUTOTUNER] RETUNING ATTEMPT AT STEP {step}")
+                        print("🔧"*35 + "\n")
+                        
                         try:
-                            a, b = estimate_parameters(nn_model, temp_c, heater_norm)
-                            tau, K = compute_tau_K(a, b, args.dt)
-                            gains = imc_pid(K, tau, L=args.imc_L, lam=args.imc_lambda) if tau and K else None
-                        except Exception as exc:
-                            gains = None
-                            print(f"Step {step:05d} | autotune failed: {exc}")
-
-                        if gains:
-                            kp, ki, kd = gains
-                            finite = all(math.isfinite(g) for g in (kp, ki, kd))
-                            non_negative = kp > 0 and ki >= 0 and kd >= 0
-                            if finite and non_negative:
-                                pid.update_gains(kp, ki, kd)
+                            # STEP 1: Estimate discrete model parameters (a, b)
+                            print(f"[AUTOTUNER] Step 1/3: Estimating discrete parameters...")
+                            a, b = estimate_parameters(
+                                nn_model, 
+                                temp_c, 
+                                heater_norm, 
+                                args.dt,
+                                verbose=True  # Detailed diagnostics
+                            )
+                            
+                            if a is not None and b is not None:
+                                # STEP 2: Convert to continuous-time parameters (τ, K)
+                                print(f"[AUTOTUNER] Step 2/3: Converting to continuous parameters...")
+                                tau, K = compute_tau_K(a, b, args.dt, verbose=True)
+                                
+                                if tau is not None and K is not None:
+                                    # STEP 3: Compute IMC-based PID gains
+                                    print(f"[AUTOTUNER] Step 3/3: Computing IMC-PID gains...")
+                                    gains = imc_pid(
+                                        K, tau, 
+                                        L=args.imc_L, 
+                                        lam=args.imc_lambda,
+                                        verbose=True
+                                    )
+                                    
+                                    if gains is not None:
+                                        kp, ki, kd = gains
+                                        
+                                        # Strict validation before applying
+                                        finite = all(math.isfinite(g) for g in (kp, ki, kd))
+                                        reasonable = (
+                                            0.1 < kp < 500 and 
+                                            0 <= ki < 100 and 
+                                            0 <= kd < 100
+                                        )
+                                        
+                                        if finite and reasonable:
+                                            print(f"\n{'='*70}")
+                                            print(f"[AUTOTUNER] ✅ NEW GAINS ACCEPTED AND APPLIED")
+                                            print(f"{'='*70}\n")
+                                            pid.update_gains(kp, ki, kd)
+                                        else:
+                                            print(f"\n{'='*70}")
+                                            print(f"[AUTOTUNER] ❌ GAINS REJECTED (outside safe ranges)")
+                                            print(f"  Kp={kp:.6f} (expect: 0.1-500, finite={math.isfinite(kp)})")
+                                            print(f"  Ki={ki:.6f} (expect: 0-100, finite={math.isfinite(ki)})")
+                                            print(f"  Kd={kd:.6f} (expect: 0-100, finite={math.isfinite(kd)})")
+                                            print(f"{'='*70}\n")
+                                    else:
+                                        print(f"\n[AUTOTUNER] ❌ IMC-PID computation returned None\n")
+                                else:
+                                    print(f"\n[AUTOTUNER] ❌ τ/K extraction failed (returned None)\n")
                             else:
-                                print(
-                                    f"Step {step:05d} | skipped unsafe gains: "
-                                    f"Kp={kp}, Ki={ki}, Kd={kd}"
-                                )
+                                print(f"\n[AUTOTUNER] ❌ Parameter estimation failed (model not ready or estimation failed)\n")
+                        
+                        except Exception as exc:
+                            print(f"\n{'='*70}")
+                            print(f"[AUTOTUNER] ❌ EXCEPTION DURING RETUNING:")
+                            print(f"  Exception type: {type(exc).__name__}")
+                            print(f"  Message: {exc}")
+                            print(f"{'='*70}\n")
+                            import traceback
+                            traceback.print_exc()
 
+                # ============================================================
+                # LOG DATA TO CSV
+                # ============================================================
                 writer.writerow(
                     [
                         datetime.now().isoformat(timespec="seconds"),
@@ -251,30 +370,75 @@ def main():
                 )
                 csv_file.flush()
 
+                # ============================================================
+                # PRINT STEP SUMMARY
+                # ============================================================
+                # Color coding for temperature error
+                if abs(error_c) < 0.5:
+                    error_indicator = "✓"
+                elif abs(error_c) < 1.0:
+                    error_indicator = "~"
+                else:
+                    error_indicator = "!"
+                
+                # Color coding for PWM (detect bang-bang)
+                if pwm_cmd == 0 or pwm_cmd == MAX_PWM_CAP:
+                    pwm_indicator = "⚠️ "
+                else:
+                    pwm_indicator = ""
+                
                 print(
-                    f"Step {step:05d} | Temp {temp_c:7.3f} C | Err {error_c:7.3f} | "
-                    f"Out {heater_norm:0.3f} | PWM {pwm_cmd:3d} | "
+                    f"Step {step:05d} | "
+                    f"Temp {temp_c:7.3f}°C | "
+                    f"Err {error_c:+7.3f}°C {error_indicator} | "
+                    f"Out {heater_norm:5.3f} | "
+                    f"{pwm_indicator}PWM {pwm_cmd:3d} | "
                     f"ESP_SAFE={int(esp_safety)} HOST_SAFE={int(host_safety)}"
+                    + (f" | Loss={loss_val:.6f}" if loss_val is not None else "")
                 )
 
+                # ============================================================
+                # READ ESP32 STATUS (OPTIONAL DIAGNOSTICS)
+                # ============================================================
                 if args.status_every > 0 and step > 0 and step % args.status_every == 0:
                     try:
                         status = read_status(args.esp_ip, args.request_timeout)
-                        print(f"Status: {status}")
-                    except Exception:
-                        pass
+                        print(f"📊 ESP32 Status: {status}")
+                    except Exception as e:
+                        print(f"⚠️  Could not read ESP32 status: {e}")
 
                 next_tick += args.dt
                 step += 1
 
         except KeyboardInterrupt:
-            print("Interrupted by user, stopping loop.")
+            print("\n\n" + "="*70)
+            print("INTERRUPTED BY USER (Ctrl+C)")
+            print("="*70)
         finally:
+            # ============================================================
+            # SAFE SHUTDOWN - SET PWM TO 0
+            # ============================================================
+            print(f"\nShutting down safely...")
             try:
                 write_pwm(args.esp_ip, 0, args.request_timeout)
-                print("Sent final PWM=0 for safe stop.")
+                print(f"✅ Sent final PWM=0 to ESP32")
             except Exception as exc:
-                print(f"Could not send final PWM=0: {exc}")
+                print(f"❌ Could not send final PWM=0: {exc}")
+            
+            print(f"\n" + "="*70)
+            print(f"RUN SUMMARY")
+            print(f"="*70)
+            print(f"  Total steps:     {step}")
+            print(f"  Total duration:  {elapsed_s:.1f}s")
+            print(f"  CSV log saved:   {args.csv}")
+            if args.autotune and nn_model is not None:
+                print(f"  NN samples:      {nn_model.total_samples_seen}")
+                print(f"  Training steps:  {nn_model.training_steps}")
+                if nn_model.train_losses:
+                    final_loss = list(nn_model.train_losses)[-1]
+                    print(f"  Final NN loss:   {final_loss:.6f}")
+            print(f"  Final PID gains: Kp={pid.Kp:.6f}, Ki={pid.Ki:.6f}, Kd={pid.Kd:.6f}")
+            print(f"="*70 + "\n")
 
 
 if __name__ == "__main__":
