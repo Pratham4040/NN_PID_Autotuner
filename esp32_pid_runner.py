@@ -59,12 +59,12 @@ def parse_args():
         description="Run PID control loop on PC using ESP32 sensor/actuator endpoints."
     )
     parser.add_argument("--esp-ip", required=True, help="ESP32 IP address (example: 192.168.137.42)")
-    parser.add_argument("--setpoint", type=float, default=35.0, help="Target chamber temperature in C")
+    parser.add_argument("--setpoint", type=float, default=37.0, help="Target chamber temperature in C")
     parser.add_argument("--dt", type=float, default=1.0, help="Control period in seconds (CHANGED: was 0.7, now 1.0 for thermal systems)")
 
-    parser.add_argument("--kp", type=float, default=25.0, help="Initial Kp (CHANGED: was 69.69, now 25.0 - less aggressive)")
-    parser.add_argument("--ki", type=float, default=8.0, help="Initial Ki (CHANGED: was 68.69, now 8.0 - less aggressive)")
-    parser.add_argument("--kd", type=float, default=3.0, help="Initial Kd (CHANGED: was 69.0, now 3.0 - less aggressive)")
+    parser.add_argument("--kp", type=float, default=0.129829, help="Initial Kp (CHANGED: was 69.69, now 25.0 - less aggressive)")
+    parser.add_argument("--ki", type=float, default=0.009182, help="Initial Ki (CHANGED: was 68.69, now 8.0 - less aggressive)")
+    parser.add_argument("--kd", type=float, default=0.155795, help="Initial Kd (CHANGED: was 69.0, now 3.0 - less aggressive)")
 
     parser.add_argument("--steps", type=int, default=0, help="Number of control steps, 0 means run forever")
     parser.add_argument("--duration", type=float, default=0.0, help="Run duration in seconds, 0 means no limit")
