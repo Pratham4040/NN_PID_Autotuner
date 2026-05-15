@@ -6,6 +6,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime
+from collections import deque
 
 from pid import PID
 
@@ -59,12 +60,12 @@ def parse_args():
         description="Run PID control loop on PC using ESP32 sensor/actuator endpoints."
     )
     parser.add_argument("--esp-ip", required=True, help="ESP32 IP address (example: 192.168.137.42)")
-    parser.add_argument("--setpoint", type=float, default=37.0, help="Target chamber temperature in C")
+    parser.add_argument("--setpoint", type=float, default=35.0, help="Target chamber temperature in C")
     parser.add_argument("--dt", type=float, default=1.0, help="Control period in seconds (CHANGED: was 0.7, now 1.0 for thermal systems)")
 
-    parser.add_argument("--kp", type=float, default=0.129829, help="Initial Kp (CHANGED: was 69.69, now 25.0 - less aggressive)")
-    parser.add_argument("--ki", type=float, default=0.009182, help="Initial Ki (CHANGED: was 68.69, now 8.0 - less aggressive)")
-    parser.add_argument("--kd", type=float, default=0.155795, help="Initial Kd (CHANGED: was 69.0, now 3.0 - less aggressive)")
+    parser.add_argument("--kp", type=float, default=1, help="Initial Kp (CHANGED: was 69.69, now 25.0 - less aggressive)")
+    parser.add_argument("--ki", type=float, default=2, help="Initial Ki (CHANGED: was 68.69, now 8.0 - less aggressive)")
+    parser.add_argument("--kd", type=float, default=3, help="Initial Kd (CHANGED: was 69.0, now 3.0 - less aggressive)")
 
     parser.add_argument("--steps", type=int, default=0, help="Number of control steps, 0 means run forever")
     parser.add_argument("--duration", type=float, default=0.0, help="Run duration in seconds, 0 means no limit")
@@ -77,6 +78,7 @@ def parse_args():
     parser.add_argument("--status-every", type=int, default=20, help="Print /status every N steps, 0 disables")
 
     parser.add_argument("--autotune", action="store_true", help="Enable online NN-based autotuning")
+    parser.add_argument("--lstm", action="store_true", help="Use LSTM plant model for autotuning")
     parser.add_argument("--retune-every", type=int, default=150, help="Retune period in steps (CHANGED: was 50, now 150 - less frequent)")
     parser.add_argument("--retune-start", type=int, default=250, help="Start retuning after this step (CHANGED: was 100, now 250 - wait for NN convergence)")
     parser.add_argument("--imc-L", type=float, default=1.2, help="IMC dead-time estimate (CHANGED: was 0.7, now 1.2)")
@@ -90,12 +92,15 @@ def main():
 
     if args.dt <= 0:
         raise ValueError("--dt must be > 0")
+    if args.lstm and not args.autotune:
+        raise ValueError("--lstm requires --autotune")
 
     # Initialize PID controller with verbose logging
     pid = PID(args.kp, args.ki, args.kd, args.dt, verbose=True)
     
     # Initialize autotuning components
     nn_model = None
+    lstm_history = None
     estimate_parameters = None
     compute_tau_K = None
     imc_pid = None
@@ -105,7 +110,10 @@ def main():
             from autotuner import compute_tau_K as _compute_tau_K
             from autotuner import estimate_parameters as _estimate_parameters
             from autotuner import imc_pid as _imc_pid
-            from neural_model import NeuralPlantModel
+            if args.lstm:
+                from lstm_model import LSTMPlantModel
+            else:
+                from neural_model import NeuralPlantModel
         except ImportError as exc:
             raise ImportError(
                 "--autotune requires neural_model/autotuner dependencies (torch, numpy)."
@@ -116,18 +124,32 @@ def main():
         imc_pid = _imc_pid
         
         # Create neural model with verbose diagnostics and proper normalization
-        nn_model = NeuralPlantModel(
-            temp_ref=args.setpoint,  # Use setpoint as reference temperature
-            temp_scale=10.0,          # Expected deviation range ±10°C
-            verbose=True              # Enable detailed logging
-        )
+        if args.lstm:
+            nn_model = LSTMPlantModel(
+                temp_ref=args.setpoint,
+                temp_scale=10.0,
+                seq_len=20,
+                verbose=True,
+            )
+            # Rolling history for LSTM training: last N pairs (T, U)
+            lstm_history = deque(maxlen=nn_model.sequence_length)
+        else:
+            nn_model = NeuralPlantModel(
+                temp_ref=args.setpoint,  # Use setpoint as reference temperature
+                temp_scale=10.0,          # Expected deviation range ±10°C
+                verbose=True              # Enable detailed logging
+            )
         
         print("\n" + "🤖"*35)
         print("AUTOTUNING ENABLED - Neural Network Will Learn Plant Dynamics")
         print("🤖"*35)
+        model_name = "LSTM" if args.lstm else "FFN"
+        print(f"  Plant model: {model_name}")
+        if args.lstm:
+            print(f"  Sequence length: {nn_model.sequence_length}")
         print(f"  Normalization: (T - {args.setpoint}) / 10.0")
-        print(f"  First retune at step: {args.retune_start}")
-        print(f"  Retune frequency: every {args.retune_every} steps")
+        print(f"  Retune frequency: every {args.retune_every} steps (loss-gated)")
+        print("  Retune start: disabled (loss-only gating)")
         print(f"  IMC parameters: L={args.imc_L}, λ={args.imc_lambda}")
         print("🤖"*35 + "\n")
 
@@ -257,16 +279,26 @@ def main():
                 # ============================================================
                 loss_val = None
                 if args.autotune and nn_model is not None:
-                    # Add training sample (need at least 3 historical points)
-                    if len(temps) >= 3:
-                        nn_model.add_sample(
-                            temps[-3],   # T[k-2]
-                            temps[-2],   # T[k-1]
-                            powers[-2],  # U[k-1]
-                            powers[-3],  # U[k-2]
-                            temps[-1],   # T[k] (target to predict)
-                        )
-                    
+                    if args.lstm:
+                        # LSTM training sample uses the previous N steps to predict current T.
+                        # We must add the sample before pushing the current (T, U).
+                        if lstm_history is not None and len(lstm_history) == nn_model.sequence_length:
+                            nn_model.add_sequence_sample(list(lstm_history), temp_c)
+
+                        # Update rolling history with the current measurement and command.
+                        if lstm_history is not None:
+                            lstm_history.append((temp_c, heater_norm))
+                    else:
+                        # FFN training sample uses the previous two steps to predict current T.
+                        if len(temps) >= 3:
+                            nn_model.add_sample(
+                                temps[-2],   # T[k-1]
+                                temps[-3],   # T[k-2]
+                                powers[-2],  # U[k-1]
+                                powers[-3],  # U[k-2]
+                                temps[-1],   # T[k] (target to predict)
+                            )
+
                     # Train neural network with mini-batching
                     loss_val = nn_model.train_step(batch_size=32, num_epochs=1)
                     losses.append(loss_val if loss_val is not None else float("nan"))
@@ -278,7 +310,7 @@ def main():
                     # ========================================================
                     # ATTEMPT PID RETUNING
                     # ========================================================
-                    if step >= args.retune_start and step % args.retune_every == 0:
+                    if step > 0 and step % args.retune_every == 0:
                         print("\n" + "🔧"*35)
                         print(f"[AUTOTUNER] RETUNING ATTEMPT AT STEP {step}")
                         print("🔧"*35 + "\n")

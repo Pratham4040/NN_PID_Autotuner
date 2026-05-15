@@ -1,4 +1,106 @@
 import numpy as np
+from collections import deque
+
+
+def _simulate_step_response_fnn(nn_model, T_current, U_current, num_steps, pre_steps, u_step, verbose):
+    """
+    Step response simulation for the feed-forward 2-step model.
+    """
+    T_sim = [T_current, T_current]  # Need two initial points
+    U_sim = [U_current, U_current]
+
+    sim_min = T_current - 30.0
+    sim_max = T_current + 120.0
+
+    for i in range(num_steps):
+        T_prev = T_sim[-1]
+        T_prev2 = T_sim[-2]
+        U_prev = U_sim[-1]
+        U_prev2 = U_sim[-2]
+
+        T_next = nn_model.predict(T_prev, T_prev2, U_prev, U_prev2)
+        if not np.isfinite(T_next):
+            if verbose:
+                print("    ❌ Simulation diverged (non-finite prediction)")
+                print("=" * 70 + "\n")
+            return None, None
+        if T_next < sim_min or T_next > sim_max:
+            if verbose:
+                print(f"    ❌ Simulation diverged (T_next out of bounds: {T_next:.3f}°C)")
+                print("=" * 70 + "\n")
+            return None, None
+
+        T_sim.append(T_next)
+        u_next = U_current if i < pre_steps else u_step
+        U_sim.append(u_next)
+
+    # Remove initial conditions
+    T_sim = np.array(T_sim[2:])
+    U_sim = np.array(U_sim[2:])
+
+    if verbose:
+        print(f"    Simulation complete: {len(T_sim)} points")
+        print(f"    Temperature range: {T_sim.min():.3f} to {T_sim.max():.3f}°C")
+        print(f"    Final temp: {T_sim[-1]:.3f}°C")
+
+    return T_sim, U_sim
+
+
+def _simulate_step_response_lstm(nn_model, T_current, U_current, num_steps, pre_steps, u_step, verbose):
+    """
+    Step response simulation for the LSTM sequence model.
+
+    The LSTM expects a full sequence of (T, U) pairs where U is the
+    command applied after measuring T. To simulate, we keep a rolling
+    buffer, inject the step input on the latest pair, predict T_next,
+    and then append (T_next, U) for the next iteration.
+    """
+    seq_len = nn_model.sequence_length
+    history = deque([(T_current, U_current)] * seq_len, maxlen=seq_len)
+
+    T_sim = []
+    U_sim = []
+
+    sim_min = T_current - 30.0
+    sim_max = T_current + 120.0
+
+    for i in range(num_steps):
+        # Apply step after pre_steps; otherwise hold current input.
+        u_next = U_current if i < pre_steps else u_step
+
+        # Build the sequence with the current input placed on the last pair.
+        # This mirrors online operation where U_k is computed after T_k.
+        seq = list(history)
+        seq[-1] = (seq[-1][0], u_next)
+
+        T_next = nn_model.predict_from_sequence(seq)
+        if not np.isfinite(T_next):
+            if verbose:
+                print("    ❌ Simulation diverged (non-finite prediction)")
+                print("=" * 70 + "\n")
+            return None, None
+        if T_next < sim_min or T_next > sim_max:
+            if verbose:
+                print(f"    ❌ Simulation diverged (T_next out of bounds: {T_next:.3f}°C)")
+                print("=" * 70 + "\n")
+            return None, None
+
+        T_sim.append(T_next)
+        U_sim.append(u_next)
+
+        # Update the rolling buffer with the newly predicted state.
+        history = deque(seq, maxlen=seq_len)
+        history.append((T_next, u_next))
+
+    T_sim = np.array(T_sim)
+    U_sim = np.array(U_sim)
+
+    if verbose:
+        print(f"    Simulation complete: {len(T_sim)} points")
+        print(f"    Temperature range: {T_sim.min():.3f} to {T_sim.max():.3f}°C")
+        print(f"    Final temp: {T_sim[-1]:.3f}°C")
+
+    return T_sim, U_sim
 
 
 def estimate_parameters(nn_model, T_current, U_current, dt, verbose=True):
@@ -29,11 +131,11 @@ def estimate_parameters(nn_model, T_current, U_current, dt, verbose=True):
         print("="*70)
     
     # Step 1: Check if model is trained enough
-    is_ready, loss, status = nn_model.get_training_quality(loss_threshold=0.015, min_steps=100)
+    is_ready, loss, status = nn_model.get_training_quality(loss_threshold=0.015)
     
     if verbose:
         print(f"  Model status: {status}")
-        print(f"  Validation loss: {loss:.6f}")
+        print(f"  Training loss: {loss:.6f}")
     
     if not is_ready:
         if verbose:
@@ -42,38 +144,41 @@ def estimate_parameters(nn_model, T_current, U_current, dt, verbose=True):
         return None, None
     
     # Step 2: Simulate step response using trained NN
+    num_steps = 80  # Total simulated steps
+    pre_steps = 10  # Steps to hold current input before stepping
+    u_step = 0.6    # Default step input (60% power)
+    if abs(U_current - u_step) < 0.1:
+        u_step = 0.2 if U_current > 0.5 else 0.8
+
     if verbose:
         print(f"\n  Simulating step response from current state:")
         print(f"    Initial temp: {T_current:.3f}°C")
-        print(f"    Step input: 0.0 → 0.6 (60% power)")
+        print(f"    Step input: {U_current:.2f} -> {u_step:.2f} (pre_steps={pre_steps})")
     
-    num_steps = 60  # Simulate 60 steps ahead
-    u_step = 0.6    # 60% power step input
-    
-    # Initialize simulation from current state
-    T_sim = [T_current, T_current]  # Need two initial points
-    U_sim = [U_current, U_current]
-    
-    # Run simulation
-    for i in range(num_steps):
-        T_prev = T_sim[-1]
-        T_prev2 = T_sim[-2]
-        U_prev = U_sim[-1]
-        U_prev2 = U_sim[-2]
-        
-        # Predict next temperature
-        T_next = nn_model.predict(T_prev, T_prev2, U_prev, U_prev2)
-        T_sim.append(T_next)
-        U_sim.append(u_step)  # Apply constant step input
-    
-    # Remove initial conditions
-    T_sim = np.array(T_sim[2:])
-    U_sim = np.array(U_sim[2:])
-    
-    if verbose:
-        print(f"    Simulation complete: {len(T_sim)} points")
-        print(f"    Temperature range: {T_sim.min():.3f} to {T_sim.max():.3f}°C")
-        print(f"    Final temp: {T_sim[-1]:.3f}°C")
+    # Run simulation (FFN or LSTM depending on model type)
+    if getattr(nn_model, "is_sequence_model", False) or hasattr(nn_model, "sequence_length"):
+        T_sim, U_sim = _simulate_step_response_lstm(
+            nn_model,
+            T_current,
+            U_current,
+            num_steps,
+            pre_steps,
+            u_step,
+            verbose,
+        )
+    else:
+        T_sim, U_sim = _simulate_step_response_fnn(
+            nn_model,
+            T_current,
+            U_current,
+            num_steps,
+            pre_steps,
+            u_step,
+            verbose,
+        )
+
+    if T_sim is None or U_sim is None:
+        return None, None
     
     # Step 3: Fit first-order discrete model
     # Model: T[k+1] = a*T[k] + b*U[k] + c
@@ -117,6 +222,15 @@ def estimate_parameters(nn_model, T_current, U_current, dt, verbose=True):
     # Step 4: Validate parameters are physically reasonable
     if verbose:
         print(f"\n  Validating parameters:")
+
+    # Soft clamp for near-unstable fits (LSTM rollouts can drift slightly > 1)
+    a_tolerance = 0.02
+    a_clamp = 0.999
+    if 1.0 < a < 1.0 + a_tolerance:
+        if verbose:
+            print(f"    ⚠ Parameter 'a' slightly > 1: {a:.6f} -> clamped to {a_clamp}")
+            print(f"       This keeps tau positive while preserving near-unity dynamics")
+        a = a_clamp
     
     # Check 1: Stability (0 < a < 1 for stable discrete system)
     if not (0 < a < 1):

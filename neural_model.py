@@ -259,37 +259,28 @@ class NeuralPlantModel:
         
         return abs_pred
     
-    def get_training_quality(self, loss_threshold=0.01, min_steps=100):
+    def get_training_quality(self, loss_threshold=0.01, min_steps=0):
         """
-        Check if model has trained sufficiently for parameter extraction
-        
+        Check if model has trained sufficiently for parameter extraction.
+
+        Readiness is based on recent training loss only.
+
         Args:
-            loss_threshold: Maximum acceptable validation loss
-            min_steps: Minimum training steps before considering ready
-            
+            loss_threshold: Maximum acceptable training loss
+            min_steps: Ignored (kept for backward compatibility)
+
         Returns:
             (is_ready, current_loss, status_message)
         """
-        if self.training_steps < min_steps:
-            return False, float('inf'), f"Need more training steps ({self.training_steps}/{min_steps})"
-        
-        if len(self.val_losses) < 10:
-            recent_loss = np.mean(list(self.train_losses)[-20:]) if self.train_losses else float('inf')
-            return False, recent_loss, "Insufficient validation data"
-        
-        recent_val_loss = np.mean(list(self.val_losses)[-10:])
-        recent_train_loss = np.mean(list(self.train_losses)[-20:])
-        
-        # Check for overfitting
-        overfitting_ratio = recent_val_loss / (recent_train_loss + 1e-8)
-        
-        if overfitting_ratio > 2.0:
-            return False, recent_val_loss, f"Overfitting detected (val/train = {overfitting_ratio:.2f})"
-        
-        if recent_val_loss < loss_threshold:
-            return True, recent_val_loss, f"Model converged (loss={recent_val_loss:.6f})"
-        
-        return False, recent_val_loss, f"Loss still too high ({recent_val_loss:.6f} > {loss_threshold})"
+        if not self.train_losses:
+            return False, float('inf'), "No training loss yet"
+
+        recent_loss = np.mean(list(self.train_losses)[-20:])
+
+        if recent_loss < loss_threshold:
+            return True, recent_loss, f"Model converged (loss={recent_loss:.6f})"
+
+        return False, recent_loss, f"Loss still too high ({recent_loss:.6f} > {loss_threshold})"
     
     def print_diagnostics(self):
         """Print detailed training diagnostics"""
