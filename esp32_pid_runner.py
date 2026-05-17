@@ -11,7 +11,7 @@ from collections import deque
 from pid import PID
 
 
-MAX_PWM_CAP = 125
+MAX_PWM_CAP = 255
 
 
 def http_get_text(url, timeout_s):
@@ -79,6 +79,7 @@ def parse_args():
 
     parser.add_argument("--autotune", action="store_true", help="Enable online NN-based autotuning")
     parser.add_argument("--lstm", action="store_true", help="Use LSTM plant model for autotuning")
+    parser.add_argument("--lstmfuzzy", action="store_true", help="Enable LSTM + fuzzy PI predictive control (no Kd)")
     parser.add_argument("--retune-every", type=int, default=150, help="Retune period in steps (CHANGED: was 50, now 150 - less frequent)")
     parser.add_argument("--retune-start", type=int, default=250, help="Start retuning after this step (CHANGED: was 100, now 250 - wait for NN convergence)")
     parser.add_argument("--imc-L", type=float, default=1.2, help="IMC dead-time estimate (CHANGED: was 0.7, now 1.2)")
@@ -92,11 +93,17 @@ def main():
 
     if args.dt <= 0:
         raise ValueError("--dt must be > 0")
+    if args.lstmfuzzy and abs(args.dt - 0.7) > 1e-9:
+        raise ValueError("--lstmfuzzy requires --dt 0.7")
     if args.lstm and not args.autotune:
         raise ValueError("--lstm requires --autotune")
+    if args.lstmfuzzy and args.autotune:
+        print("[WARN] --autotune ignored when --lstmfuzzy is enabled")
 
     # Initialize PID controller with verbose logging
-    pid = PID(args.kp, args.ki, args.kd, args.dt, verbose=True)
+    pid = None
+    if not args.lstmfuzzy:
+        pid = PID(args.kp, args.ki, args.kd, args.dt, verbose=True)
     
     # Initialize autotuning components
     nn_model = None
@@ -104,8 +111,18 @@ def main():
     estimate_parameters = None
     compute_tau_K = None
     imc_pid = None
+    fuzzy_model = None
+    fuzzy_controller = None
+    fuzzy_history = None
+    fuzzy_initialized = False
+    fuzzy_prev_error = 0.0
+    fuzzy_integral = 0.0
+    fuzzy_prev_pwm = 0.0
+    fuzzy_last_sequence = None
+    fuzzy_integral_min = -15.0
+    fuzzy_integral_max = 15.0
     
-    if args.autotune:
+    if args.autotune and not args.lstmfuzzy:
         try:
             from autotuner import compute_tau_K as _compute_tau_K
             from autotuner import estimate_parameters as _estimate_parameters
@@ -153,9 +170,45 @@ def main():
         print(f"  IMC parameters: L={args.imc_L}, λ={args.imc_lambda}")
         print("🤖"*35 + "\n")
 
+    if args.lstmfuzzy:
+        try:
+            from lstm_fuzzy_model import LSTMFuzzyPlantModel
+            from fuzzy_pi import FuzzyPIController
+        except ImportError as exc:
+            raise ImportError(
+                "--lstmfuzzy requires lstm_fuzzy_model/fuzzy_pi dependencies (torch)."
+            ) from exc
+
+        fuzzy_model = LSTMFuzzyPlantModel(
+            seq_len=30,
+            temp_ref=args.setpoint,
+            temp_scale=10.0,
+            verbose=True,
+        )
+        base_kp = max(args.kp, 0.3)
+        base_ki = max(args.ki, 0.3)
+        fuzzy_controller = FuzzyPIController(
+            base_kp=base_kp,
+            base_ki=base_ki,
+            dt=args.dt,
+        )
+        fuzzy_history = deque(maxlen=fuzzy_model.sequence_length)
+
+        print("\n" + "=" * 70)
+        print("[LSTMFUZZY] LSTM + FUZZY PI MODE ENABLED")
+        print("=" * 70)
+        print(f"  Sequence length: {fuzzy_model.sequence_length}")
+        print(f"  Baseline gains: Kp={base_kp:.3f}, Ki={base_ki:.3f}")
+        print(f"  Control period: {args.dt:.3f}s")
+        print("=" * 70 + "\n")
+
     temps = []
     powers = []
     losses = []
+
+    final_kp = args.kp
+    final_ki = args.ki
+    final_kd = args.kd
 
     consecutive_failures = 0
     step = 0
@@ -245,8 +298,58 @@ def main():
                 # COMPUTE PID CONTROL OUTPUT
                 # ============================================================
                 error_c = args.setpoint - temp_c
-                heater_norm = pid.Calculate_heater(args.setpoint, temp_c)
+                loss_val = None
+
+                if args.lstmfuzzy:
+                    if not fuzzy_initialized:
+                        for _ in range(fuzzy_model.sequence_length):
+                            fuzzy_history.append((temp_c, 0.0))
+                        fuzzy_initialized = True
+
+                    if fuzzy_history:
+                        last_temp, _ = fuzzy_history[-1]
+                        fuzzy_history[-1] = (last_temp, fuzzy_prev_pwm)
+
+                    if fuzzy_last_sequence is not None:
+                        loss_val = fuzzy_model.train_step(fuzzy_last_sequence, temp_c)
+
+                    fuzzy_history.append((temp_c, 0.0))
+                    sequence = list(fuzzy_history)
+                    pred_temp = fuzzy_model.predict_next(sequence)
+
+                    pred_error = args.setpoint - pred_temp
+                    # ec is in deg C/s, explicitly scaled by dt
+                    error_rate = (pred_error - fuzzy_prev_error) / args.dt
+
+                    kp, ki, _, _ = fuzzy_controller.compute_gains(pred_error, error_rate)
+
+                    fuzzy_integral += pred_error * args.dt
+                    if fuzzy_integral > fuzzy_integral_max:
+                        fuzzy_integral = fuzzy_integral_max
+                    elif fuzzy_integral < fuzzy_integral_min:
+                        fuzzy_integral = fuzzy_integral_min
+
+                    heater_norm = kp * pred_error + ki * fuzzy_integral
+
+                    current_kp = kp
+                    current_ki = ki
+                    current_kd = 0.0
+
+                    fuzzy_prev_error = pred_error
+                    fuzzy_prev_pwm = max(0.0, min(1.0, heater_norm))
+                    fuzzy_last_sequence = sequence
+
+                    heater_norm = fuzzy_prev_pwm
+                else:
+                    heater_norm = pid.Calculate_heater(args.setpoint, temp_c)
+                    current_kp = pid.Kp
+                    current_ki = pid.Ki
+                    current_kd = pid.Kd
+
                 host_safety = temp_c >= args.host_max_temp
+                final_kp = current_kp
+                final_ki = current_ki
+                final_kd = current_kd
 
                 # Safety override
                 if esp_safety or host_safety:
@@ -277,8 +380,7 @@ def main():
                 # ============================================================
                 # NEURAL NETWORK TRAINING & AUTOTUNING
                 # ============================================================
-                loss_val = None
-                if args.autotune and nn_model is not None:
+                if args.autotune and not args.lstmfuzzy and nn_model is not None:
                     if args.lstm:
                         # LSTM training sample uses the previous N steps to predict current T.
                         # We must add the sample before pushing the current (T, U).
@@ -394,9 +496,9 @@ def main():
                         pwm_cmd,
                         int(bool(esp_safety)),
                         int(bool(host_safety)),
-                        round(pid.Kp, 6),
-                        round(pid.Ki, 6),
-                        round(pid.Kd, 6),
+                        round(current_kp, 6),
+                        round(current_ki, 6),
+                        round(current_kd, 6),
                         "" if loss_val is None else round(float(loss_val), 8),
                     ]
                 )
@@ -463,13 +565,13 @@ def main():
             print(f"  Total steps:     {step}")
             print(f"  Total duration:  {elapsed_s:.1f}s")
             print(f"  CSV log saved:   {args.csv}")
-            if args.autotune and nn_model is not None:
+            if args.autotune and not args.lstmfuzzy and nn_model is not None:
                 print(f"  NN samples:      {nn_model.total_samples_seen}")
                 print(f"  Training steps:  {nn_model.training_steps}")
                 if nn_model.train_losses:
                     final_loss = list(nn_model.train_losses)[-1]
                     print(f"  Final NN loss:   {final_loss:.6f}")
-            print(f"  Final PID gains: Kp={pid.Kp:.6f}, Ki={pid.Ki:.6f}, Kd={pid.Kd:.6f}")
+            print(f"  Final gains: Kp={final_kp:.6f}, Ki={final_ki:.6f}, Kd={final_kd:.6f}")
             print(f"="*70 + "\n")
 
 
