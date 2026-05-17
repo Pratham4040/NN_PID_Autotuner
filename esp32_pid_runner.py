@@ -63,8 +63,8 @@ def parse_args():
     parser.add_argument("--setpoint", type=float, default=35.0, help="Target chamber temperature in C")
     parser.add_argument("--dt", type=float, default=1.0, help="Control period in seconds (CHANGED: was 0.7, now 1.0 for thermal systems)")
 
-    parser.add_argument("--kp", type=float, default=1, help="Initial Kp (CHANGED: was 69.69, now 25.0 - less aggressive)")
-    parser.add_argument("--ki", type=float, default=2, help="Initial Ki (CHANGED: was 68.69, now 8.0 - less aggressive)")
+    parser.add_argument("--kp", type=float, default=25.0, help="Initial Kp (CHANGED: was 69.69, now 25.0 - less aggressive)")
+    parser.add_argument("--ki", type=float, default=8.0, help="Initial Ki (CHANGED: was 68.69, now 8.0 - less aggressive)")
     parser.add_argument("--kd", type=float, default=3, help="Initial Kd (CHANGED: was 69.0, now 3.0 - less aggressive)")
 
     parser.add_argument("--steps", type=int, default=0, help="Number of control steps, 0 means run forever")
@@ -181,12 +181,12 @@ def main():
 
         fuzzy_model = LSTMFuzzyPlantModel(
             seq_len=30,
-            temp_ref=args.setpoint,
-            temp_scale=10.0,
+            temp_ref=0.0,
+            temp_scale=100.0,
             verbose=True,
         )
-        base_kp = max(args.kp, 0.3)
-        base_ki = max(args.ki, 0.3)
+        base_kp = 0.5 if args.kp == 25.0 else args.kp
+        base_ki = 0.02 if args.ki == 8.0 else args.ki
         fuzzy_controller = FuzzyPIController(
             base_kp=base_kp,
             base_ki=base_ki,

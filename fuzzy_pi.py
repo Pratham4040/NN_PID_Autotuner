@@ -15,17 +15,15 @@ class FuzzyPIController:
         base_kp,
         base_ki,
         dt,
-        e_small=0.3,
-        e_large=2.0,
+        e_small=0.5,
+        e_large=3.0,
         ec_small=0.02,
         ec_large=0.15,
-        dkp_boost=0.6,
-        dkp_brake=0.4,
-        dki_boost=0.02,
-        kp_min=0.3,
-        ki_min=0.3,
-        kp_max=500.0,
-        ki_max=100.0,
+        kp_min=0.01,
+        ki_min=0.001,
+        kp_max=50.0,
+        ki_max=10.0,
+        **kwargs
     ):
         self.base_kp = max(float(base_kp), kp_min)
         self.base_ki = max(float(base_ki), ki_min)
@@ -36,9 +34,10 @@ class FuzzyPIController:
         self.ec_small = float(ec_small)
         self.ec_large = float(ec_large)
 
-        self.dkp_boost = float(dkp_boost)
-        self.dkp_brake = float(dkp_brake)
-        self.dki_boost = float(dki_boost)
+        # Dynamic boosts so gains scale with base values.
+        self.dkp_boost = float(self.base_kp * 0.8)
+        self.dkp_brake = float(self.base_kp * 0.8)
+        self.dki_boost = float(self.base_ki * 0.5)
 
         self.kp_min = float(kp_min)
         self.ki_min = float(ki_min)
